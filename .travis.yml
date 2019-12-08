@@ -1,0 +1,11 @@
+language: rust
+sudo: false
+
+rust:
+ - nightly-2019-12-07
+
+before_script:
+ - cargo install --force cargo-audit
+script:
+ - cargo check
+ - cargo audit
