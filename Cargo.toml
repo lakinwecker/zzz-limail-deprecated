@@ -2,6 +2,11 @@
 name = "limail"
 version = "0.1.0"
 authors = ["Lakin Wecker <lakin@wecker.ca>"]
+description = "A helper for dealing with mailgun for lichess"
+repository = "https://github.com/lakinwecker/limail"
+readme = "README.md"
+license = "AGPL-3.0+"
+edition = "2018"
 
 [dependencies]
 slack = "0.22.0"
