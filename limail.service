@@ -5,7 +5,6 @@ Description=Limail server
 After=network.target
 
 [Service]
-LimitNOFILE=83368
 User=www-data
 Group=www-data
 EnvironmentFile=-/etc/limail/env
