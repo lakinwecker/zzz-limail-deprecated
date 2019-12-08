@@ -157,7 +157,7 @@ fn forward_email_to_slack(
 
     slack_client.sender.lock().and_then(|s| {
        let slack_message = format!(
-                "{}\n ```{}```\n(from: {})",
+                "{}\n```{}```\n(from: {})",
                 subject,
                 body_plain,
                 sender
