@@ -180,7 +180,8 @@ fn env_or_panic(k: &str) -> String {
 
 fn mount() -> Rocket {
     rocket::ignite().mount("/", routes![
-        no_reply_response
+        no_reply_response,
+        forward_email_to_slack
     ])
 }
 
