@@ -111,6 +111,7 @@ impl Mailgun {
             .form(&params)
             .send()
             .map_err(|_| String::from("Unable to make request"))?;
+        info!("Email autoresponder sent to: {}", email.recipient);
         Ok(())
     }
 }
@@ -163,12 +164,18 @@ fn forward_email_to_slack(
                 sender
             );
         s.send_message(&channel_id, &slack_message).and_then(|_| {
+            info!("Email forwarded to: {} from {}", channel_id, email.sender);
             Ok(String::from("hello world"))
-        }).or_else(|_| {
+        }).or_else(|err| {
+            warn!("Error forwarding to: {} from {}. Error: {}", channel_id, email.sender, err);
             Ok(String::from("hello world"))
         })
+        //.map_err(|err| std::sync::PoisonError())
     // TODO: the following is the wrong HTTP error.
-    }).map_err(|_| bad_request("Unable to sendslack message"))
+    }).map_err(|err| {
+        warn!("Error forwarding to: {} from {}. Error: {}", channel_id, email.sender, err);
+        bad_request("Unable to sendslack message")
+    })
 }
 
 fn env_or_panic(k: &str) -> String {
