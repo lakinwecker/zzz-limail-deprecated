@@ -21,9 +21,11 @@ extern crate rocket;
 extern crate rocket_contrib;
 extern crate dotenv;
 extern crate slack;
-extern crate crypto;
 extern crate hex;
 extern crate reqwest;
+extern crate hmac;
+extern crate sha2;
+#[macro_use] extern crate log;
 
 use std::sync::Mutex;
 use std::env;
@@ -34,37 +36,25 @@ use rocket::{Rocket, post, routes, FromForm, State};
 use rocket::request::{LenientForm};
 use rocket::response::status::BadRequest;
 
-use slack::{Event, RtmClient, Message, Sender};
+use slack::{Event, RtmClient, Sender};
 use dotenv::dotenv;
-use crypto::sha2::Sha256;
-use crypto::hmac::{Hmac};
-use crypto::mac::{Mac, MacResult};
+use sha2::Sha256;
+use hmac::{Hmac, Mac};
 
 type HmacSha256 = Hmac<Sha256>;
 
 struct SlackHandler {
-    sender: Option<Sender>,
 }
 
 #[allow(unused_variables)]
 impl slack::EventHandler for SlackHandler {
     fn on_event(&mut self, cli: &RtmClient, event: Event) {
-        match event {
-            Event::Message(box Message::Standard(msg)) => {
-                msg.text.and_then(|txt| Some(println!("Message: {}", txt)));
-            },
-            _ => {}
-        };
     }
 
     fn on_close(&mut self, cli: &RtmClient) {
-        println!("on_close");
-        self.sender = None
     }
 
     fn on_connect(&mut self, cli: &RtmClient) {
-        println!("on_connect");
-        self.sender = Some(cli.sender().clone())
     }
 }
 
@@ -93,18 +83,17 @@ struct Mailgun {
     from: String
 }
 impl Mailgun {
-    fn verify_hmac(&self, email: &MailgunEmailReceived) -> Result<bool, BadRequest<String>> {
-        let mut mac = Hmac::new(Sha256::new(), &self.api_key.clone().into_bytes());
+    fn verify_hmac(&self, email: &MailgunEmailReceived) -> Result<(), BadRequest<String>> {
+        let mut mac = HmacSha256::new_varkey(&self.api_key.clone().into_bytes())
+            .map_err(|_| bad_request("Unable to create MAC"))?;
+
         let msg = email.timestamp.to_string() + &email.token;
         mac.input(&msg.into_bytes());
 
         let signature_bytes = hex::decode(&email.signature)
             .map_err(|_| bad_request("Unable to decode signature"))?;
-        if mac.result() == MacResult::new(&signature_bytes) {
-            return Ok(true);
-        }
-
-        Err(bad_request("Bad hmac"))
+        mac.verify(&signature_bytes)
+            .map_err(|_| bad_request("Bad HMAC"))
     }
 
     fn send_email(&self, email: &EmailTemplate) -> Result<(), String> {
@@ -201,6 +190,7 @@ struct SlackClient {
 
 fn main() {
     dotenv().ok();
+    env_logger::init();
 
     let api_key = env_or_panic("SLACK_API_TOKEN");
     let slack_client = RtmClient::login(&api_key)
@@ -208,13 +198,14 @@ fn main() {
     let sender = Mutex::new(slack_client.sender().clone());
 
     let slack_thread = thread::spawn(move || {
-        let mut handler = SlackHandler{
-            sender: None
-        };
-        let r = slack_client.run(&mut handler);
-        match r {
-            Ok(_) => { }
-            Err(err) => panic!("Error: {}", err),
+        loop {
+            let mut handler = SlackHandler{};
+            info!("Connecting to Slack");
+            let r = slack_client.run(&mut handler);
+            match r {
+                Ok(_) => { }
+                Err(err) => error!("Slack Error: {}", err),
+            }
         }
     });
     let rocket = mount();
