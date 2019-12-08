@@ -5,31 +5,33 @@ extern crate rocket;
 extern crate rocket_contrib;
 extern crate dotenv;
 extern crate slack;
-extern crate hmac;
-extern crate sha2;
-extern crate serde;
+extern crate crypto;
+extern crate hex;
+extern crate reqwest;
 
-
-
-use rocket::{post, routes};
-use rocket_contrib::json::Json;
-use slack::{Event, RtmClient, Message, Sender};
-use dotenv::dotenv;
+use std::sync::Mutex;
 use std::env;
 use std::string::String;
 use std::thread;
-use sha2::Sha256;
-use hmac::{Hmac, Mac};
-use serde::{Deserialize, Serialize};
+
+use rocket::{Rocket, post, routes, FromForm, State};
+use rocket::request::{LenientForm};
+use rocket::response::status::BadRequest;
+
+use slack::{Event, RtmClient, Message, Sender};
+use dotenv::dotenv;
+use crypto::sha2::Sha256;
+use crypto::hmac::{Hmac};
+use crypto::mac::{Mac, MacResult};
 
 type HmacSha256 = Hmac<Sha256>;
 
-struct MyHandler {
+struct SlackHandler {
     sender: Option<Sender>,
 }
 
 #[allow(unused_variables)]
-impl slack::EventHandler for MyHandler {
+impl slack::EventHandler for SlackHandler {
     fn on_event(&mut self, cli: &RtmClient, event: Event) {
         match event {
             Event::Message(box Message::Standard(msg)) => {
@@ -50,39 +52,118 @@ impl slack::EventHandler for MyHandler {
     }
 }
 
-#[derive(Deserialize, Serialize)]
-struct MailgunEmailReceived {
+struct EmailTemplate {
     recipient: String,
+    subject: String,
+    template: String
+}
+
+#[derive(FromForm)]
+struct MailgunEmailReceived {
     sender: String,
     from: String,
     subject: String,
-    #[serde(rename(serialize = "body-plain"))]
+    #[form(field = "body-plain")]
     body_plain: String,
-    #[serde(rename(serialize = "stripped-text"))]
-    stripped_text: String,
-    #[serde(rename(serialize = "stripped-signature"))]
-    stripped_signature: String,
-    #[serde(rename(serialize = "body-html"))]
-    body_html: String,
-    #[serde(rename(serialize = "stripped-html"))]
-    stripped_html: String,
-    #[serde(rename(serialize = "attachment-count"))]
-    attachment_count: String,
-    #[serde(rename(serialize = "attachment-x"))]
-    attachment_x: String,
-    timestamp: String,
+    timestamp: i64,
     token: String,
     signature: String,
-    #[serde(rename(serialize = "message-headers"))]
-    message_headers: String,
-    #[serde(rename(serialize = "content-id-map"))]
-    content_id_map: String,
+
 }
 
-#[post("/no-reply/response", data = "<email>")]
-fn no_reply_response(email: Json<MailgunEmailReceived>) -> String {
-    println!("{}", serde_json::to_string(&email.into_inner()).unwrap());
-    String::from("Hello, world!")
+struct Mailgun {
+    api_key: String,
+    domain: String,
+    from: String
+}
+impl Mailgun {
+    fn verify_hmac(&self, email: &MailgunEmailReceived) -> Result<bool, BadRequest<String>> {
+        let mut mac = Hmac::new(Sha256::new(), &self.api_key.clone().into_bytes());
+        let msg = email.timestamp.to_string() + &email.token;
+        mac.input(&msg.into_bytes());
+
+        let signature_bytes = hex::decode(&email.signature)
+            .map_err(|_| bad_request("Unable to decode signature"))?;
+        if mac.result() == MacResult::new(&signature_bytes) {
+            return Ok(true);
+        }
+
+        Err(bad_request("Bad hmac"))
+    }
+
+    fn send_email(&self, email: &EmailTemplate) -> Result<(), String> {
+        let params = [
+            ("from", &self.from),
+            ("to", &email.recipient),
+            ("subject", &email.subject),
+            ("template", &email.template),
+            ("h:X-Autoreply", &String::from("yes"))
+        ];
+        let client = reqwest::Client::new();
+        let url = format!("https://api.mailgun.net/v3/{}/messages", self.domain);
+        client.post(&url)
+            .basic_auth("api", Some(&self.api_key))
+            .form(&params)
+            .send()
+            .map_err(|_| String::from("Unable to make request"))?;
+        Ok(())
+    }
+}
+
+
+fn bad_request(msg: &str) -> BadRequest<String> {
+    BadRequest(Some(String::from(msg)))
+}
+
+
+#[post("/emails/responder/<template>", data = "<email_form>")]
+fn no_reply_response(
+    mailgun: State<Mailgun>,
+    email_form: LenientForm<MailgunEmailReceived>,
+    template: String
+) ->  Result<String, BadRequest<String>> {
+    let email = email_form.into_inner();
+    let mailgun = mailgun.inner();
+    mailgun.verify_hmac(&email)?;
+    mailgun.send_email(&EmailTemplate {
+        recipient: email.from,
+        subject: format!("Re: {}", email.subject),
+        template: template
+
+    }).map_err(|msg| bad_request(&msg))?;
+    Ok(String::from("hello world"))
+
+}
+
+#[post("/emails/forward/slack/<channel_id>", data = "<email_form>")]
+fn forward_email_to_slack(
+    slack_client_state: State<SlackClient>,
+    mailgun: State<Mailgun>,
+    channel_id: String,
+    email_form: LenientForm<MailgunEmailReceived>
+) ->  Result<String, BadRequest<String>> {
+    let slack_client = slack_client_state.inner();
+    let email = email_form.into_inner();
+    let subject = email.subject.clone();
+    let body_plain = email.body_plain.clone();
+    let sender = email.sender.clone();
+
+    mailgun.inner().verify_hmac(&email)?;
+
+    slack_client.sender.lock().and_then(|s| {
+       let slack_message = format!(
+                "{}\n ```{}```\n(from: {})",
+                subject,
+                body_plain,
+                sender
+            );
+        s.send_message(&channel_id, &slack_message).and_then(|_| {
+            Ok(String::from("hello world"))
+        }).or_else(|_| {
+            Ok(String::from("hello world"))
+        })
+    // TODO: the following is the wrong HTTP error.
+    }).map_err(|_| bad_request("Unable to sendslack message"))
 }
 
 fn env_or_panic(k: &str) -> String {
@@ -92,25 +173,41 @@ fn env_or_panic(k: &str) -> String {
     }
 }
 
+fn mount() -> Rocket {
+    rocket::ignite().mount("/", routes![
+        no_reply_response
+    ])
+}
+
+struct SlackClient {
+    sender: Mutex<Sender>,
+}
+
 fn main() {
     dotenv().ok();
 
     let api_key = env_or_panic("SLACK_API_TOKEN");
-    let mailgun_api_key = env_or_panic("MAILGUN_API_KEY");
+    let slack_client = RtmClient::login(&api_key)
+        .expect("Unable to login with slack");
+    let sender = Mutex::new(slack_client.sender().clone());
+
     let slack_thread = thread::spawn(move || {
-        let mut handler = MyHandler{
+        let mut handler = SlackHandler{
             sender: None
         };
-        let r = RtmClient::login_and_run(&api_key, &mut handler);
+        let r = slack_client.run(&mut handler);
         match r {
-            Ok(_) => {}
+            Ok(_) => { }
             Err(err) => panic!("Error: {}", err),
         }
     });
-    rocket::ignite().mount("/", routes![no_reply_response]).launch();
-    let res = slack_thread.join();
-    match res { 
-        Ok(_) => {}
-        Err(_) => panic!("Error joining string")
-    }
+    let rocket = mount();
+    rocket.manage(SlackClient {
+        sender
+    }).manage(Mailgun {
+        api_key: env_or_panic("MAILGUN_API_KEY"),
+        domain: env_or_panic("MAILGUN_DOMAIN"),
+        from: env_or_panic("MAILGUN_FROM")
+    }).launch();
+    slack_thread.join().expect("Unable to join slack thread");
 }
