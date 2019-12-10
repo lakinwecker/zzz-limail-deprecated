@@ -27,7 +27,7 @@ extern crate hmac;
 extern crate sha2;
 #[macro_use] extern crate log;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::env;
 use std::string::String;
 use std::thread;
@@ -150,32 +150,27 @@ fn forward_email_to_slack(
 ) ->  Result<String, BadRequest<String>> {
     let slack_client = slack_client_state.inner();
     let email = email_form.into_inner();
-    let subject = email.subject.clone();
-    let body_plain = email.body_plain.clone();
-    let sender = email.sender.clone();
 
     mailgun.inner().verify_hmac(&email)?;
 
-    slack_client.sender.lock().and_then(|s| {
-       let slack_message = format!(
-                "{}\n```{}```\n(from: {})",
-                subject,
-                body_plain,
-                sender
-            );
-        s.send_message(&channel_id, &slack_message).and_then(|_| {
-            info!("Email forwarded to: {} from {}", channel_id, email.sender);
-            Ok(String::from("hello world"))
-        }).or_else(|err| {
-            warn!("Error forwarding to: {} from {}. Error: {}", channel_id, email.sender, err);
-            Ok(String::from("hello world"))
-        })
-        //.map_err(|err| std::sync::PoisonError())
-    // TODO: the following is the wrong HTTP error.
-    }).map_err(|err| {
+    let sender =
+        slack_client
+            .sender.lock()
+            .expect("Unable to obtain mutex lock");
+    let slack_message = format!(
+        "{}\n```{}```\n(from: {})",
+        email.subject.clone(),
+        email.body_plain.clone(),
+        email.sender.clone()
+    );
+    sender.send_message(&channel_id, &slack_message).and_then(|_| {
+        info!("Email forwarded to: {} from {}", channel_id, email.sender);
+        Ok(String::from("hello world"))
+    }).or_else(|err| {
         warn!("Error forwarding to: {} from {}. Error: {}", channel_id, email.sender, err);
-        bad_request("Unable to sendslack message")
+            Ok(String::from("hello world"))
     })
+
 }
 
 fn env_or_panic(k: &str) -> String {
@@ -193,7 +188,7 @@ fn mount() -> Rocket {
 }
 
 struct SlackClient {
-    sender: Mutex<Sender>,
+    sender: Arc<Mutex<Sender>>,
 }
 
 fn main() {
@@ -203,13 +198,18 @@ fn main() {
     let api_key = env_or_panic("SLACK_API_TOKEN");
     let slack_client = RtmClient::login(&api_key)
         .expect("Unable to login with slack");
-    let sender = Mutex::new(slack_client.sender().clone());
+    let sender1 = Arc::new(Mutex::new(slack_client.sender().clone()));
+    let sender = sender1.clone();
 
     let slack_thread = thread::spawn(move || {
         loop {
-            let mut handler = SlackHandler{};
             info!("Connecting to Slack");
+            let slack_client = RtmClient::login(&api_key)
+                .expect("Unable to login with slack");
+            let mut handler = SlackHandler{};
             let r = slack_client.run(&mut handler);
+            info!("");
+            *sender1.lock().unwrap() = slack_client.sender().clone();
             match r {
                 Ok(_) => { }
                 Err(err) => error!("Slack Error: {}", err),
