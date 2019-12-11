@@ -17,46 +17,77 @@
 #![feature(proc_macro_hygiene, decl_macro)]
 #![feature(box_patterns)]
 
+extern crate dotenv;
+extern crate hex;
+extern crate hmac;
+#[macro_use] extern crate log;
+extern crate reqwest;
 extern crate rocket;
 extern crate rocket_contrib;
-extern crate dotenv;
-extern crate slack;
-extern crate hex;
-extern crate reqwest;
-extern crate hmac;
+extern crate serde;
 extern crate sha2;
-#[macro_use] extern crate log;
 
-use std::sync::{Arc, Mutex};
 use std::env;
 use std::string::String;
-use std::thread;
 
 use rocket::{Rocket, post, routes, FromForm, State};
 use rocket::request::{LenientForm};
 use rocket::response::status::BadRequest;
 
-use slack::{Event, RtmClient, Sender};
+use reqwest::header::{CONTENT_TYPE, AUTHORIZATION};
+
 use dotenv::dotenv;
 use sha2::Sha256;
 use hmac::{Hmac, Mac};
 
+use serde::{Serialize, Deserialize};
+
 type HmacSha256 = Hmac<Sha256>;
 
-struct SlackHandler {
+
+const SLACK_URL: &str = "https://slack.com/api/";
+enum SlackError {
+    HttpError(String)
 }
 
-#[allow(unused_variables)]
-impl slack::EventHandler for SlackHandler {
-    fn on_event(&mut self, cli: &RtmClient, event: Event) {
-    }
-
-    fn on_close(&mut self, cli: &RtmClient) {
-    }
-
-    fn on_connect(&mut self, cli: &RtmClient) {
+impl std::convert::From<reqwest::Error> for SlackError {
+    fn from(_error: reqwest::Error) -> Self {
+        // TODO: properly implement this
+        SlackError::HttpError(String::from("Reqwest Error"))
     }
 }
+struct Slack {
+    api_key: String
+}
+#[derive(Serialize, Deserialize, Debug)]
+struct MessageResponse {
+    ok: bool,
+    ts: String,
+}
+#[derive(Serialize, Deserialize, Debug)]
+struct SlackMessage {
+    channel: String,
+    text: String,
+    thread_ts: Option<String>, // TODO: Make this better typed
+    as_user: bool
+}
+impl Slack {
+    fn send_message(&self, message: &SlackMessage) -> Result<MessageResponse, SlackError> {
+        let client = reqwest::Client::new();
+        let url = format!("{}/chat.postMessage", SLACK_URL);
+        let msg_response: MessageResponse = client.post(&url)
+            .header(AUTHORIZATION, format!("Bearer {}", &self.api_key))
+            .header(CONTENT_TYPE, "application/json")
+            .json(&message)
+            .send()?
+            .json()?;
+
+        Ok(msg_response)
+    }
+}
+
+
+
 
 struct EmailTemplate {
     recipient: String,
@@ -118,6 +149,7 @@ impl Mailgun {
 
 
 fn bad_request(msg: &str) -> BadRequest<String> {
+    warn!("Bad request: {}!", msg);
     BadRequest(Some(String::from(msg)))
 }
 
@@ -143,7 +175,7 @@ fn no_reply_response(
 
 #[post("/emails/forward/slack/<channel_id>", data = "<email_form>")]
 fn forward_email_to_slack(
-    slack_client_state: State<SlackClient>,
+    slack_client_state: State<Slack>,
     mailgun: State<Mailgun>,
     channel_id: String,
     email_form: LenientForm<MailgunEmailReceived>
@@ -153,23 +185,31 @@ fn forward_email_to_slack(
 
     mailgun.inner().verify_hmac(&email)?;
 
-    let sender =
-        slack_client
-            .sender.lock()
-            .expect("Unable to obtain mutex lock");
-    let slack_message = format!(
-        "{}\n```{}```\n(from: {})",
-        email.subject.clone(),
-        email.body_plain.clone(),
-        email.sender.clone()
-    );
-    sender.send_message(&channel_id, &slack_message).and_then(|_| {
-        info!("Email forwarded to: {} from {}", channel_id, email.sender);
-        Ok(String::from("hello world"))
-    }).or_else(|err| {
-        warn!("Error forwarding to: {} from {}. Error: {}", channel_id, email.sender, err);
-            Ok(String::from("hello world"))
-    })
+    let text = format!("Email Received: {}", email.subject.clone());
+    slack_client
+        .send_message(&SlackMessage{ 
+            channel: channel_id.clone(),
+            text: text.clone(),
+            thread_ts: None,
+            as_user: true
+        })
+        .map_err(|_| bad_request("Unable to send slack message"))
+        .and_then(|msg_response| {
+            let slack_message = format!(
+                "```{}```\n(from: {})",
+                email.body_plain.clone(),
+                email.sender.clone()
+            );
+            slack_client
+                .send_message(&SlackMessage{ 
+                    channel: channel_id.clone(),
+                    text: slack_message.clone(),
+                    thread_ts: Some(msg_response.ts.clone()),
+                    as_user: true
+                })
+                .map_err(|_| bad_request("Unable to send slack message"))
+        })?;
+    Ok(String::from("Sent"))
 
 }
 
@@ -187,42 +227,17 @@ fn mount() -> Rocket {
     ])
 }
 
-struct SlackClient {
-    sender: Arc<Mutex<Sender>>,
-}
-
 fn main() {
     dotenv().ok();
     env_logger::init();
 
-    let api_key = env_or_panic("SLACK_API_TOKEN");
-    let slack_client = RtmClient::login(&api_key)
-        .expect("Unable to login with slack");
-    let sender1 = Arc::new(Mutex::new(slack_client.sender().clone()));
-    let sender = sender1.clone();
-
-    let slack_thread = thread::spawn(move || {
-        loop {
-            info!("Connecting to Slack");
-            let slack_client = RtmClient::login(&api_key)
-                .expect("Unable to login with slack");
-            let mut handler = SlackHandler{};
-            let r = slack_client.run(&mut handler);
-            info!("");
-            *sender1.lock().unwrap() = slack_client.sender().clone();
-            match r {
-                Ok(_) => { }
-                Err(err) => error!("Slack Error: {}", err),
-            }
-        }
-    });
     let rocket = mount();
-    rocket.manage(SlackClient {
-        sender
+
+    rocket.manage(Slack {
+        api_key: env_or_panic("SLACK_API_TOKEN")
     }).manage(Mailgun {
         api_key: env_or_panic("MAILGUN_API_KEY"),
         domain: env_or_panic("MAILGUN_DOMAIN"),
         from: env_or_panic("MAILGUN_FROM")
     }).launch();
-    slack_thread.join().expect("Unable to join slack thread");
 }
