@@ -25,6 +25,7 @@ extern crate reqwest;
 extern crate rocket;
 extern crate rocket_contrib;
 extern crate serde;
+extern crate serde_json;
 extern crate sha2;
 
 use std::env;
@@ -41,6 +42,7 @@ use sha2::Sha256;
 use hmac::{Hmac, Mac};
 
 use serde::{Serialize, Deserialize};
+use serde_json::{Value};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -92,9 +94,20 @@ impl Slack {
 struct EmailTemplate {
     recipient: String,
     subject: String,
-    template: String
+    template: String,
+    in_reply_to: String, //<CAB9UryRH2vfsD9NmtM9884KKhmKrtaiDiO0176nbOySsK0PvCw@mail.gmail.com>
+    references: String //<CAB9UryRH2vfsD9NmtM9884KKhmKrtaiDiO0176nbOySsK0PvCw@mail.gmail.com>
 }
 
+enum MailgunError {
+    JsonError(String)
+}
+impl std::convert::From<serde_json::Error> for MailgunError {
+    fn from(_error: serde_json::Error) -> Self {
+        // TODO: properly implement this
+        MailgunError::JsonError(String::from("JSON Error"))
+    }
+}
 #[derive(FromForm)]
 struct MailgunEmailReceived {
     sender: String,
@@ -105,6 +118,45 @@ struct MailgunEmailReceived {
     timestamp: i64,
     token: String,
     signature: String,
+    #[form(field = "message-headers")]
+    message_headers: String,
+}
+impl MailgunEmailReceived {
+    fn get_message_id(&self) -> Result<String, MailgunError> {
+        let v: Value = serde_json::from_str(&self.message_headers)?;
+        let mailgun_error = MailgunError::JsonError(String::from("Unable to parse json"));
+        let err = Err(MailgunError::JsonError(String::from("Unable to parse json")));
+        match v {
+            Value::Array(values) => {
+                values.iter().find(
+                    |v| match v {
+                        Value::Array(value_pair) => {
+                            value_pair.len() == 2 && (match &value_pair[0] {
+                                Value::String(s) => s.to_lowercase() == "message-id",
+                                _ => false
+                            })
+                        },
+                        _ => false
+                    }
+                ).and_then(
+                    |v| match v {
+                        Value::Array(value_pair) => {
+                            match &value_pair[1] {
+                                Value::String (s) => Some(s.clone()),
+                                _ => None
+                            }
+                        },
+                        _ => None
+                    }
+                ).ok_or(mailgun_error)
+            },
+            _ => err
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct MailgunMessageHeaders {
 
 }
 
@@ -133,7 +185,9 @@ impl Mailgun {
             ("to", &email.recipient),
             ("subject", &email.subject),
             ("template", &email.template),
-            ("h:X-Autoreply", &String::from("yes"))
+            ("h:X-Autoreply", &String::from("yes")),
+            ("h:In-Reply-To", &email.in_reply_to),
+            ("h:References", &email.references)
         ];
         let client = reqwest::Client::new();
         let url = format!("https://api.mailgun.net/v3/{}/messages", self.domain);
@@ -163,10 +217,14 @@ fn no_reply_response(
     let email = email_form.into_inner();
     let mailgun = mailgun.inner();
     mailgun.verify_hmac(&email)?;
+    let message_id = email.get_message_id()
+        .map_err(|_| bad_request("Unable to get message_id"))?;
     mailgun.send_email(&EmailTemplate {
         recipient: email.from,
         subject: format!("Re: {}", email.subject),
-        template: template
+        template: template,
+        in_reply_to: message_id.clone(),
+        references: message_id
 
     }).map_err(|msg| bad_request(&msg))?;
     Ok(String::from("hello world"))
