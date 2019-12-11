@@ -95,8 +95,8 @@ struct EmailTemplate {
     recipient: String,
     subject: String,
     template: String,
-    in_reply_to: String, //<CAB9UryRH2vfsD9NmtM9884KKhmKrtaiDiO0176nbOySsK0PvCw@mail.gmail.com>
-    references: String //<CAB9UryRH2vfsD9NmtM9884KKhmKrtaiDiO0176nbOySsK0PvCw@mail.gmail.com>
+    in_reply_to: String,
+    references: String
 }
 
 enum MailgunError {
