@@ -48,15 +48,6 @@ use dotenv::dotenv;
 
 use warp::{path, Filter, Rejection};
 
-
-/*
-fn mount() -> Rocket {
-    rocket::ignite().mount("/", routes![
-        no_reply_response,
-        forward_email_to_slack
-    ])
-}*/
-
 fn env_or_panic(k: &str) -> String {
     match env::var(k)  {
         Ok(val) => val,
