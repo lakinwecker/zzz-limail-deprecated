@@ -31,7 +31,7 @@ extern crate tokio;
 extern crate warp;
 
 mod slack;
-// use slack::{Slack, SlackMessage};
+use slack::{Slack, SlackMessage};
 mod mailgun;
 use mailgun::{
     Mailgun,
@@ -50,47 +50,6 @@ use warp::{path, Filter, Rejection};
 
 
 /*
-
-#[post("/emails/forward/slack/<channel_id>", data = "<email_form>")]
-fn forward_email_to_slack(
-    slack_client_state: State<Slack>,
-    mailgun: State<Mailgun>,
-    channel_id: String,
-    email_form: LenientForm<MailgunEmailReceived>
-) ->  Result<String, BadRequest<String>> {
-    let slack_client = slack_client_state.inner();
-    let email = email_form.into_inner();
-
-    mailgun.inner().verify_hmac(&email)?;
-
-    let text = format!("Email Received: {}", email.subject.clone());
-    slack_client
-        .send_message(&SlackMessage{ 
-            channel: channel_id.clone(),
-            text: text.clone(),
-            thread_ts: None,
-            as_user: true
-        })
-        .map_err(|_| bad_request("Unable to send slack message"))
-        .and_then(|msg_response| {
-            let slack_message = format!(
-                "```{}```\n(from: {})",
-                email.body_plain.clone(),
-                email.sender.clone()
-            );
-            slack_client
-                .send_message(&SlackMessage{ 
-                    channel: channel_id.clone(),
-                    text: slack_message.clone(),
-                    thread_ts: Some(msg_response.ts.clone()),
-                    as_user: true
-                })
-                .map_err(|_| bad_request("Unable to send slack message"))
-        })?;
-    Ok(String::from("Sent"))
-
-}
-
 fn mount() -> Rocket {
     rocket::ignite().mount("/", routes![
         no_reply_response,
@@ -116,20 +75,34 @@ fn main() {
     };
     let mailgun = warp::any().map(move || mailgun.clone());
 
+    let slack = Slack {
+        api_key: env_or_panic("SLACK_API_TOKEN")
+    };
+    let slack = warp::any().map(move || slack.clone());
+
 
     // GET /hello/warp => 200 OK with body "Hello, warp!"
     let no_reply_urlencoded = warp::post2()
-        .and(mailgun)
+        .and(mailgun.clone())
         .and(path!("emails" / "responder" / String))
         .and(warp::body::content_length_limit(1024 * 1024 * 2)) // 2 MB right?
         .and(warp::body::form())
         .and_then(send_no_reply_template)
         .recover(mailgun_to_warp_rejection);
 
+    let forward_email = warp::post2()
+        .and(mailgun.clone())
+        .and(slack)
+        .and(path!("emails" / "forward" / String))
+        .and(warp::body::content_length_limit(1024 * 1024 * 2)) // 2 MB right?
+        .and(warp::body::form())
+        .and_then(forward_email_to_slack)
+        .recover(mailgun_to_warp_rejection);
+
     let socket_address: SocketAddr = env_or_panic("LISTEN_ADDRESS_PORT").parse()
         .expect("LISTEN_ADDRESS_PORT must be a valid SocketAddr");
 
-    warp::serve(no_reply_urlencoded)
+    warp::serve(no_reply_urlencoded.or(forward_email))
         .run(socket_address);
 
 }
@@ -150,3 +123,38 @@ fn send_no_reply_template(mailgun: Mailgun, template: String, email: MailgunEmai
     })?;
     Ok("Message Processed")
 }
+
+fn forward_email_to_slack(
+    mailgun: Mailgun,
+    slack_client: Slack,
+    channel_id: String,
+    email: MailgunEmailReceived
+) ->  Result<impl warp::Reply, Rejection> {
+    mailgun.verify_hmac(&email)?;
+
+    let text = format!("Email Received: {}", email.subject.clone());
+    slack_client
+        .send_message(&SlackMessage{ 
+            channel: channel_id.clone(),
+            text: text.clone(),
+            thread_ts: None,
+            as_user: true
+        })
+        .and_then(|msg_response| {
+            let slack_message = format!(
+                "```{}```\n(from: {})",
+                email.body_plain.clone(),
+                email.sender.clone()
+            );
+            slack_client
+                .send_message(&SlackMessage{ 
+                    channel: channel_id.clone(),
+                    text: slack_message.clone(),
+                    thread_ts: Some(msg_response.ts.clone()),
+                    as_user: true
+                })
+        })?;
+    Ok(String::from("Sent"))
+
+}
+

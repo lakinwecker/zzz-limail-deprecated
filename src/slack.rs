@@ -1,7 +1,13 @@
+use std::error::Error as StdError;
+
 use reqwest::header::{CONTENT_TYPE, AUTHORIZATION};
 use serde::{Serialize, Deserialize};
+use std::fmt::{self, Display};
+use warp::{http::{StatusCode}, Rejection, Reply};
 
 const SLACK_URL: &str = "https://slack.com/api/";
+
+#[derive(Debug)]
 pub enum SlackError {
     HttpError(String)
 }
@@ -12,6 +18,22 @@ impl std::convert::From<reqwest::Error> for SlackError {
         SlackError::HttpError(String::from("Reqwest Error"))
     }
 }
+impl std::convert::From<SlackError> for Rejection {
+    fn from(err: SlackError) -> Rejection {
+        warp::reject::custom(err)
+    }
+}
+
+impl Display for SlackError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            SlackError::HttpError(s) => s,
+        })
+    }
+}
+impl StdError for SlackError {}
+
+#[derive(Clone)]
 pub struct Slack {
     pub api_key: String
 }
