@@ -6,7 +6,7 @@ use hmac::{Hmac, Mac};
 type HmacSha256 = Hmac<Sha256>;
 use serde::{Serialize, Deserialize};
 use serde_json::{Value};
-use warp::{http::{StatusCode}, Rejection, Reply};
+use warp::Rejection;
 
 pub struct EmailTemplate {
     pub recipient: String,
@@ -45,31 +45,6 @@ impl Display for MailgunError {
 }
 impl StdError for MailgunError {}
 
-#[derive(Serialize)]
-struct MailgunErrorMessage {
-    code: u16,
-    message: String,
-}
-
-pub fn mailgun_to_warp_rejection(err: Rejection) -> Result<impl Reply, Rejection> {
-    if let Some(err) = err.find_cause::<MailgunError>() {
-        let (code, msg) = match err {
-            MailgunError::JsonError(s) => (StatusCode::BAD_REQUEST, s),
-            MailgunError::HmacError(s) => (StatusCode::BAD_REQUEST, s),
-            MailgunError::MailgunError(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
-        };
-
-        let json = warp::reply::json(&MailgunErrorMessage {
-            code: code.as_u16(),
-            message: msg.clone(),
-        });
-        Ok(warp::reply::with_status(json, code))
-    } else {
-        // Could be a NOT_FOUND, or any other internal error... here we just
-        // let warp use its default rendering.
-        Err(err)
-    }
-}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MailgunEmailReceived {

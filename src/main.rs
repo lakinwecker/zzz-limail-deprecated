@@ -29,24 +29,39 @@ extern crate serde_json;
 extern crate sha2;
 extern crate tokio;
 extern crate warp;
+extern crate futures;
+
 
 mod slack;
 use slack::{Slack, SlackMessage};
 mod mailgun;
 use mailgun::{
+    EmailTemplate,
     Mailgun,
     MailgunEmailReceived,
-    EmailTemplate,
-    mailgun_to_warp_rejection
+    MailgunError,
 };
 
 use std::env;
 use std::string::String;
 use std::net::SocketAddr;
+use std::error::Error as StdError;
+use std::fmt::{self, Display};
+use std::str;
+use futures::stream::{Stream};
+use crate::futures::Future;
+
+use serde::Serialize;
 
 use dotenv::dotenv;
 
-use warp::{path, Filter, Rejection};
+use warp::{
+    path,
+    Filter,
+    Rejection,
+    http::{StatusCode},
+    filters::multipart::{self, FormData, Part},
+};
 
 fn env_or_panic(k: &str) -> String {
     match env::var(k)  {
@@ -71,35 +86,147 @@ fn main() {
     };
     let slack = warp::any().map(move || slack.clone());
 
+    let basics = warp::post2()
+        .and(warp::body::content_length_limit(1024 * 1024 * 2)) // 2 MB right?
+        .and(mailgun.clone());
 
-    // GET /hello/warp => 200 OK with body "Hello, warp!"
-    let no_reply_urlencoded = warp::post2()
-        .and(mailgun.clone())
+    let urlencoded = basics.clone()
+        .and(warp::body::form());
+
+    let no_reply_urlencoded = urlencoded.clone()
         .and(path!("emails" / "responder" / String))
-        .and(warp::body::content_length_limit(1024 * 1024 * 2)) // 2 MB right?
-        .and(warp::body::form())
         .and_then(send_no_reply_template)
-        .recover(mailgun_to_warp_rejection);
+        .recover(recover_error);
 
-    let forward_email = warp::post2()
-        .and(mailgun.clone())
-        .and(slack)
+    let no_reply_multipart = basics.clone()
+        .and(path!("emails" / "responder" / String))
+        .and(multipart::form())
+        .and_then(send_no_reply_template_multipart)
+        .recover(recover_error);
+
+    let forward_email = urlencoded.clone()
+        .and(slack.clone())
         .and(path!("emails" / "forward" / String))
-        .and(warp::body::content_length_limit(1024 * 1024 * 2)) // 2 MB right?
-        .and(warp::body::form())
         .and_then(forward_email_to_slack)
-        .recover(mailgun_to_warp_rejection);
+        .recover(recover_error);
 
     let socket_address: SocketAddr = env_or_panic("LISTEN_ADDRESS_PORT").parse()
         .expect("LISTEN_ADDRESS_PORT must be a valid SocketAddr");
 
-    warp::serve(no_reply_urlencoded.or(forward_email))
+    warp::serve(no_reply_urlencoded.or(forward_email).or(no_reply_multipart))
         .run(socket_address);
 
 }
 
 
-fn send_no_reply_template(mailgun: Mailgun, template: String, email: MailgunEmailReceived)
+#[derive(Serialize)]
+struct LimailErrorMessage {
+    code: u16,
+    message: String,
+}
+
+pub fn recover_error(err: Rejection) -> Result<impl warp::Reply, Rejection> {
+    if let Some(err) = err.find_cause::<MailgunError>() {
+        let (code, msg) = match err {
+            MailgunError::JsonError(s) => (StatusCode::BAD_REQUEST, s),
+            MailgunError::HmacError(s) => (StatusCode::BAD_REQUEST, s),
+            MailgunError::MailgunError(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+        };
+
+        let json = warp::reply::json(&LimailErrorMessage {
+            code: code.as_u16(),
+            message: msg.clone(),
+        });
+        Ok(warp::reply::with_status(json, code))
+    } else {
+        // Could be a NOT_FOUND, or any other internal error... here we just
+        // let warp use its default rendering.
+        Err(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum MultipartError {
+    MissingFields(),
+}
+
+impl StdError for MultipartError {}
+impl Display for MultipartError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            MultipartError::MissingFields() => "MultipartError::MissingFields",
+        })
+    }
+}
+impl std::convert::From<MultipartError> for Rejection {
+    fn from(err: MultipartError) -> Rejection {
+        warp::reject::custom(err)
+    }
+}
+
+
+fn part_to_string(part: Part) -> Option<String> {
+    let bytes = part.concat2().wait().ok()?;
+    match str::from_utf8(&bytes) {
+        Ok(s) => Some(String::from(s)),
+        Err(_) => None
+    }
+}
+
+// Gross - Surely there is some way to do this that's easier . :(
+fn multipart_to_mailgun(form_data: FormData) -> Result<MailgunEmailReceived, MultipartError> {
+    let mut sender: Option<String> = None;
+    let mut from: Option<String> = None;
+    let mut subject: Option<String> = None;
+    let mut body_plain: Option<String> = None;
+    let mut timestamp: Option<i64> = None;
+    let mut token: Option<String> = None;
+    let mut signature: Option<String> = None;
+    let mut message_headers: Option<String> = None;
+    form_data.wait().for_each(|part| {
+        match part {
+            Ok(part) => {
+                let name = String::from(part.name());
+                match (&name[..], part_to_string(part)) {
+                    ("sender", val) => sender = val,
+                    ("from", val) => from = val,
+                    ("subject", val) => subject = val,
+                    ("body-plain", val) => body_plain = val,
+                    ("timestamp", Some(val)) => timestamp = val.parse().ok(),
+                    ("token", val) => token = val,
+                    ("signature", val) => signature = val,
+                    ("message-headers", val) => message_headers = val,
+                    _ => ()
+                }
+            },
+            _ => return
+        }
+    });
+    match (sender, from, subject, body_plain, timestamp, token, signature, message_headers) {
+        (Some(sender), Some(from), Some(subject), Some(body_plain),
+         Some(timestamp), Some(token), Some(signature), Some(message_headers)) => Ok(MailgunEmailReceived {
+            sender,
+            from,
+            subject,
+            body_plain,
+            timestamp,
+            token,
+            signature,
+            message_headers,
+        }),
+        _ => Err(MultipartError::MissingFields())
+    }
+}
+
+fn send_no_reply_template_multipart(mailgun: Mailgun, template: String, form_data: FormData)
+    -> Result<impl warp::Reply, Rejection>
+{
+    let mailgun_received = multipart_to_mailgun(form_data)?;
+    send_no_reply_template(mailgun, mailgun_received, template)
+}
+
+
+fn send_no_reply_template(mailgun: Mailgun, email: MailgunEmailReceived, template: String)
     -> Result<impl warp::Reply, Rejection>
 {
     mailgun.verify_hmac(&email)?;
@@ -117,9 +244,9 @@ fn send_no_reply_template(mailgun: Mailgun, template: String, email: MailgunEmai
 
 fn forward_email_to_slack(
     mailgun: Mailgun,
+    email: MailgunEmailReceived,
     slack_client: Slack,
-    channel_id: String,
-    email: MailgunEmailReceived
+    channel_id: String
 ) ->  Result<impl warp::Reply, Rejection> {
     mailgun.verify_hmac(&email)?;
 
