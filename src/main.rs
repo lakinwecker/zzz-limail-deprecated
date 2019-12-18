@@ -110,11 +110,22 @@ fn main() {
         .and_then(forward_email_to_slack)
         .recover(recover_error);
 
+    let forward_email_multipart = basics.clone()
+        .and(slack.clone())
+        .and(path!("emails" / "forward" / String))
+        .and(multipart::form())
+        .and_then(forward_email_to_slack_multipart)
+        .recover(recover_error);
+
     let socket_address: SocketAddr = env_or_panic("LISTEN_ADDRESS_PORT").parse()
         .expect("LISTEN_ADDRESS_PORT must be a valid SocketAddr");
 
-    warp::serve(no_reply_urlencoded.or(forward_email).or(no_reply_multipart))
-        .run(socket_address);
+    warp::serve(
+        no_reply_urlencoded
+        .or(no_reply_multipart)
+        .or(forward_email)
+        .or(forward_email_multipart)
+    ).run(socket_address);
 
 }
 
@@ -240,6 +251,16 @@ fn send_no_reply_template(mailgun: Mailgun, email: MailgunEmailReceived, templat
 
     })?;
     Ok("Message Processed")
+}
+
+fn forward_email_to_slack_multipart(
+    mailgun: Mailgun,
+    slack_client: Slack,
+    channel_id: String,
+    form_data: FormData,
+) ->  Result<impl warp::Reply, Rejection> {
+    let mailgun_received = multipart_to_mailgun(form_data)?;
+    forward_email_to_slack(mailgun, mailgun_received, slack_client, channel_id)
 }
 
 fn forward_email_to_slack(
