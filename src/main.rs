@@ -106,13 +106,13 @@ fn main() {
 
     let forward_email = urlencoded.clone()
         .and(slack.clone())
-        .and(path!("emails" / "forward" / String))
+        .and(path!("emails" / "forward" / "slack" / String))
         .and_then(forward_email_to_slack)
         .recover(recover_error);
 
     let forward_email_multipart = basics.clone()
         .and(slack.clone())
-        .and(path!("emails" / "forward" / String))
+        .and(path!("emails" / "forward" / "slack" / String))
         .and(multipart::form())
         .and_then(forward_email_to_slack_multipart)
         .recover(recover_error);
