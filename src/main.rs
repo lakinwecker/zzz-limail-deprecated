@@ -15,233 +15,335 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 #![feature(proc_macro_hygiene, decl_macro)]
+#![feature(plugin)]
 #![feature(box_patterns)]
 
+#[macro_use] extern crate log;
+extern crate chashmap;
 extern crate dotenv;
+extern crate futures;
 extern crate hex;
 extern crate hmac;
-#[macro_use] extern crate log;
+extern crate pretty_env_logger;
 extern crate reqwest;
-extern crate rocket;
-extern crate rocket_contrib;
 extern crate serde;
 extern crate serde_json;
 extern crate sha2;
+extern crate tokio;
+extern crate warp;
+
+
+mod slack;
+use slack::{Slack, SlackMessage};
+mod mailgun;
+use mailgun::{
+    EmailTemplate,
+    Mailgun,
+    MailgunEmailReceived,
+    MailgunError,
+};
 
 use std::env;
 use std::string::String;
+use std::net::SocketAddr;
+use std::error::Error as StdError;
+use std::fmt::{self, Display};
+use std::str;
+use std::sync::Arc;
 
-use rocket::{Rocket, post, routes, FromForm, State};
-use rocket::request::{LenientForm};
-use rocket::response::status::BadRequest;
 
-use reqwest::header::{CONTENT_TYPE, AUTHORIZATION};
+use serde::Serialize;
 
 use dotenv::dotenv;
-use sha2::Sha256;
-use hmac::{Hmac, Mac};
 
-use serde::{Serialize, Deserialize};
-use serde_json::{Value};
+use chashmap::CHashMap;
 
-type HmacSha256 = Hmac<Sha256>;
+use futures::stream::{Stream};
+use crate::futures::Future;
 
+use chrono::{DateTime, Utc};
 
-const SLACK_URL: &str = "https://slack.com/api/";
-enum SlackError {
-    HttpError(String)
-}
+use warp::{
+    path,
+    Filter,
+    Rejection,
+    http::{StatusCode},
+    filters::multipart::{self, FormData, Part},
+};
 
-impl std::convert::From<reqwest::Error> for SlackError {
-    fn from(_error: reqwest::Error) -> Self {
-        // TODO: properly implement this
-        SlackError::HttpError(String::from("Reqwest Error"))
-    }
-}
-struct Slack {
-    api_key: String
-}
-#[derive(Serialize, Deserialize, Debug)]
-struct MessageResponse {
-    ok: bool,
-    ts: String,
-}
-#[derive(Serialize, Deserialize, Debug)]
-struct SlackMessage {
-    channel: String,
-    text: String,
-    thread_ts: Option<String>, // TODO: Make this better typed
-    as_user: bool
-}
-impl Slack {
-    fn send_message(&self, message: &SlackMessage) -> Result<MessageResponse, SlackError> {
-        let client = reqwest::Client::new();
-        let url = format!("{}/chat.postMessage", SLACK_URL);
-        let msg_response: MessageResponse = client.post(&url)
-            .header(AUTHORIZATION, format!("Bearer {}", &self.api_key))
-            .header(CONTENT_TYPE, "application/json")
-            .json(&message)
-            .send()?
-            .json()?;
-
-        Ok(msg_response)
+fn env_or_panic(k: &str) -> String {
+    match env::var(k)  {
+        Ok(val) => val,
+        Err(msg) => panic!(format!("No {} in environment: {}", k, msg))
     }
 }
 
+#[derive(Clone)]
+struct Minutes(pub i64);
 
-
-
-struct EmailTemplate {
-    recipient: String,
-    subject: String,
-    template: String,
-    in_reply_to: String,
-    references: String
+#[derive(Clone)]
+struct LastResponseLog {
+    time_between_responses: Minutes,
+    last_response_date: Arc<CHashMap<String, DateTime<Utc>>>,
 }
 
-enum MailgunError {
-    JsonError(String)
-}
-impl std::convert::From<serde_json::Error> for MailgunError {
-    fn from(_error: serde_json::Error) -> Self {
-        // TODO: properly implement this
-        MailgunError::JsonError(String::from("JSON Error"))
+impl LastResponseLog {
+
+    fn is_too_old(&self, dt: &DateTime<Utc>) -> bool {
+        (Utc::now() - (*dt)).num_minutes() > self.time_between_responses.0
     }
-}
-#[derive(FromForm)]
-struct MailgunEmailReceived {
-    sender: String,
-    from: String,
-    subject: String,
-    #[form(field = "body-plain")]
-    body_plain: String,
-    timestamp: i64,
-    token: String,
-    signature: String,
-    #[form(field = "message-headers")]
-    message_headers: String,
-}
-impl MailgunEmailReceived {
-    fn get_message_id(&self) -> Result<String, MailgunError> {
-        let v: Value = serde_json::from_str(&self.message_headers)?;
-        let mailgun_error = MailgunError::JsonError(String::from("Unable to parse json"));
-        let err = Err(MailgunError::JsonError(String::from("Unable to parse json")));
-        match v {
-            Value::Array(values) => {
-                values.iter().find(
-                    |v| match v {
-                        Value::Array(value_pair) => {
-                            value_pair.len() == 2 && (match &value_pair[0] {
-                                Value::String(s) => s.to_lowercase() == "message-id",
-                                _ => false
-                            })
-                        },
-                        _ => false
-                    }
-                ).and_then(
-                    |v| match v {
-                        Value::Array(value_pair) => {
-                            match &value_pair[1] {
-                                Value::String (s) => Some(s.clone()),
-                                _ => None
-                            }
-                        },
-                        _ => None
-                    }
-                ).ok_or(mailgun_error)
-            },
-            _ => err
+
+
+    fn can_send(&self, email: &String) -> bool {
+        match self.last_response_date.get(email) {
+            Some(v) => self.is_too_old(&v),
+            None => true
         }
     }
-}
 
-#[derive(Serialize, Deserialize, Debug)]
-struct MailgunMessageHeaders {
-
-}
-
-struct Mailgun {
-    api_key: String,
-    domain: String,
-    from: String
-}
-impl Mailgun {
-    fn verify_hmac(&self, email: &MailgunEmailReceived) -> Result<(), BadRequest<String>> {
-        let mut mac = HmacSha256::new_varkey(&self.api_key.clone().into_bytes())
-            .map_err(|_| bad_request("Unable to create MAC"))?;
-
-        let msg = email.timestamp.to_string() + &email.token;
-        mac.input(&msg.into_bytes());
-
-        let signature_bytes = hex::decode(&email.signature)
-            .map_err(|_| bad_request("Unable to decode signature"))?;
-        mac.verify(&signature_bytes)
-            .map_err(|_| bad_request("Bad HMAC"))
+    fn log_send(&self, email: &String) {
+        self.clear_old();
+        self.last_response_date.insert(email.clone(), Utc::now());
     }
 
-    fn send_email(&self, email: &EmailTemplate) -> Result<(), String> {
-        let params = [
-            ("from", &self.from),
-            ("to", &email.recipient),
-            ("subject", &email.subject),
-            ("template", &email.template),
-            ("h:X-Autoreply", &String::from("yes")),
-            ("h:In-Reply-To", &email.in_reply_to),
-            ("h:References", &email.references)
-        ];
-        let client = reqwest::Client::new();
-        let url = format!("https://api.mailgun.net/v3/{}/messages", self.domain);
-        client.post(&url)
-            .basic_auth("api", Some(&self.api_key))
-            .form(&params)
-            .send()
-            .map_err(|_| String::from("Unable to make request"))?;
-        info!("Email autoresponder sent to: {}", email.recipient);
-        Ok(())
+    fn clear_old(&self) {
+        let orig_size = self.last_response_date.len();
+        self.last_response_date.retain(|_, v| !self.is_too_old(v));
+        let new_size = self.last_response_date.len();
+        info!("Cleared {} old entries from last_response_date", orig_size-new_size);
     }
 }
 
+fn main() {
+    dotenv().ok();
+    pretty_env_logger::init();
 
-fn bad_request(msg: &str) -> BadRequest<String> {
-    warn!("Bad request: {}!", msg);
-    BadRequest(Some(String::from(msg)))
+    let last_response_date: CHashMap<String, DateTime<Utc>> = CHashMap::new();
+    let last_response_log = LastResponseLog {
+        time_between_responses: Minutes(
+            env_or_panic("TIME_BETWEEN_RESPONSES_MINUTES")
+                .parse()
+                .expect("TIME_BETWEEN_RESPONSES_MINUTES must be a i64")
+        ),
+        last_response_date: Arc::new(last_response_date),
+    };
+    let last_response_log = warp::any().map(move || last_response_log.clone());
+
+    let mailgun = Mailgun {
+        api_key: env_or_panic("MAILGUN_API_KEY"),
+        domain: env_or_panic("MAILGUN_DOMAIN"),
+        from: env_or_panic("MAILGUN_FROM")
+    };
+    let mailgun = warp::any().map(move || mailgun.clone());
+
+    let slack = Slack {
+        api_key: env_or_panic("SLACK_API_TOKEN")
+    };
+    let slack = warp::any().map(move || slack.clone());
+
+    let basics = warp::post2()
+        .and(warp::body::content_length_limit(1024 * 1024 * 2)) // 2 MB right?
+        .and(mailgun.clone());
+
+    let urlencoded = basics.clone()
+        .and(warp::body::form());
+
+    let no_reply_urlencoded = urlencoded.clone()
+        .and(last_response_log.clone())
+        .and(path!("emails" / "responder" / String))
+        .and_then(send_no_reply_template)
+        .recover(recover_error);
+
+    let no_reply_multipart = basics.clone()
+        .and(multipart::form())
+        .and(last_response_log.clone())
+        .and(path!("emails" / "responder" / String))
+        .and_then(send_no_reply_template_multipart)
+        .recover(recover_error);
+
+    let forward_email = urlencoded.clone()
+        .and(slack.clone())
+        .and(path!("emails" / "forward" / "slack" / String))
+        .and_then(forward_email_to_slack)
+        .recover(recover_error);
+
+    let forward_email_multipart = basics.clone()
+        .and(slack.clone())
+        .and(path!("emails" / "forward" / "slack" / String))
+        .and(multipart::form())
+        .and_then(forward_email_to_slack_multipart)
+        .recover(recover_error);
+
+    let socket_address: SocketAddr = env_or_panic("LISTEN_ADDRESS_PORT").parse()
+        .expect("LISTEN_ADDRESS_PORT must be a valid SocketAddr");
+
+    warp::serve(
+        no_reply_urlencoded
+        .or(no_reply_multipart)
+        .or(forward_email)
+        .or(forward_email_multipart)
+    ).run(socket_address);
+
 }
 
 
-#[post("/emails/responder/<template>", data = "<email_form>")]
-fn no_reply_response(
-    mailgun: State<Mailgun>,
-    email_form: LenientForm<MailgunEmailReceived>,
+#[derive(Serialize)]
+struct LimailErrorMessage {
+    code: u16,
+    message: String,
+}
+
+pub fn recover_error(err: Rejection) -> Result<impl warp::Reply, Rejection> {
+    if let Some(err) = err.find_cause::<MailgunError>() {
+        let (code, msg) = match err {
+            MailgunError::JsonError(s) => (StatusCode::BAD_REQUEST, s),
+            MailgunError::HmacError(s) => (StatusCode::BAD_REQUEST, s),
+            MailgunError::MailgunError(s) => (StatusCode::INTERNAL_SERVER_ERROR, s),
+        };
+
+        let json = warp::reply::json(&LimailErrorMessage {
+            code: code.as_u16(),
+            message: msg.clone(),
+        });
+        Ok(warp::reply::with_status(json, code))
+    } else {
+        // Could be a NOT_FOUND, or any other internal error... here we just
+        // let warp use its default rendering.
+        Err(err)
+    }
+}
+
+#[derive(Debug)]
+pub enum MultipartError {
+    MissingFields(),
+}
+
+impl StdError for MultipartError {}
+impl Display for MultipartError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            MultipartError::MissingFields() => "MultipartError::MissingFields",
+        })
+    }
+}
+impl std::convert::From<MultipartError> for Rejection {
+    fn from(err: MultipartError) -> Rejection {
+        warp::reject::custom(err)
+    }
+}
+
+
+fn part_to_string(part: Part) -> Option<String> {
+    let bytes = part.concat2().wait().ok()?;
+    match str::from_utf8(&bytes) {
+        Ok(s) => Some(String::from(s)),
+        Err(_) => None
+    }
+}
+
+// Gross - Surely there is some way to do this that's easier . :(
+fn multipart_to_mailgun(form_data: FormData) -> Result<MailgunEmailReceived, MultipartError> {
+    let mut sender: Option<String> = None;
+    let mut from: Option<String> = None;
+    let mut subject: Option<String> = None;
+    let mut body_plain: Option<String> = None;
+    let mut timestamp: Option<i64> = None;
+    let mut token: Option<String> = None;
+    let mut signature: Option<String> = None;
+    let mut message_headers: Option<String> = None;
+    form_data.wait().for_each(|part| {
+        match part {
+            Ok(part) => {
+                let name = String::from(part.name());
+                match (&name[..], part_to_string(part)) {
+                    ("sender", val) => sender = val,
+                    ("from", val) => from = val,
+                    ("subject", val) => subject = val,
+                    ("body-plain", val) => body_plain = val,
+                    ("timestamp", Some(val)) => timestamp = val.parse().ok(),
+                    ("token", val) => token = val,
+                    ("signature", val) => signature = val,
+                    ("message-headers", val) => message_headers = val,
+                    _ => ()
+                }
+            },
+            _ => return
+        }
+    });
+    match (sender, from, subject, body_plain, timestamp, token, signature, message_headers) {
+        (Some(sender), Some(from), Some(subject), Some(body_plain),
+         Some(timestamp), Some(token), Some(signature), Some(message_headers)) => Ok(MailgunEmailReceived {
+            sender,
+            from,
+            subject,
+            body_plain,
+            timestamp,
+            token,
+            signature,
+            message_headers,
+        }),
+        _ => Err(MultipartError::MissingFields())
+    }
+}
+
+fn send_no_reply_template_multipart(
+    mailgun: Mailgun,
+    form_data: FormData,
+    last_response_log: LastResponseLog,
     template: String
-) ->  Result<String, BadRequest<String>> {
-    let email = email_form.into_inner();
-    let mailgun = mailgun.inner();
-    mailgun.verify_hmac(&email)?;
-    let message_id = email.get_message_id()
-        .map_err(|_| bad_request("Unable to get message_id"))?;
-    mailgun.send_email(&EmailTemplate {
-        recipient: email.from,
-        subject: format!("Re: {}", email.subject),
-        template: template,
-        in_reply_to: message_id.clone(),
-        references: message_id
-
-    }).map_err(|msg| bad_request(&msg))?;
-    Ok(String::from("hello world"))
-
+) -> Result<impl warp::Reply, Rejection>
+{
+    let mailgun_received = multipart_to_mailgun(form_data)?;
+    send_no_reply_template(mailgun, mailgun_received, last_response_log, template)
 }
 
-#[post("/emails/forward/slack/<channel_id>", data = "<email_form>")]
-fn forward_email_to_slack(
-    slack_client_state: State<Slack>,
-    mailgun: State<Mailgun>,
-    channel_id: String,
-    email_form: LenientForm<MailgunEmailReceived>
-) ->  Result<String, BadRequest<String>> {
-    let slack_client = slack_client_state.inner();
-    let email = email_form.into_inner();
 
-    mailgun.inner().verify_hmac(&email)?;
+fn send_no_reply_template(
+    mailgun: Mailgun,
+    email: MailgunEmailReceived,
+    last_response_log: LastResponseLog,
+    template: String
+) -> Result<impl warp::Reply, Rejection>
+{
+    mailgun.verify_hmac(&email)?;
+    let message_id = email.get_message_id()?;
+    if last_response_log.can_send(&email.from) {
+        last_response_log.log_send(&email.from);
+        mailgun.send_email(&EmailTemplate {
+            recipient: email.from,
+            subject: format!("Re: {}", email.subject),
+            template: template,
+            in_reply_to: message_id.clone(),
+            references: message_id
+
+        })?;
+    } else {
+        info!(
+            "Already responded to {} within the past {} minutes. Skipping.",
+            email.from,
+            last_response_log.time_between_responses.0
+        );
+    }
+    Ok("Message Processed")
+}
+
+fn forward_email_to_slack_multipart(
+    mailgun: Mailgun,
+    slack_client: Slack,
+    channel_id: String,
+    form_data: FormData,
+) ->  Result<impl warp::Reply, Rejection> {
+    let mailgun_received = multipart_to_mailgun(form_data)?;
+    forward_email_to_slack(mailgun, mailgun_received, slack_client, channel_id)
+}
+
+fn forward_email_to_slack(
+    mailgun: Mailgun,
+    email: MailgunEmailReceived,
+    slack_client: Slack,
+    channel_id: String
+) ->  Result<impl warp::Reply, Rejection> {
+    mailgun.verify_hmac(&email)?;
 
     let text = format!("Email Received: {}", email.subject.clone());
     slack_client
@@ -251,7 +353,6 @@ fn forward_email_to_slack(
             thread_ts: None,
             as_user: true
         })
-        .map_err(|_| bad_request("Unable to send slack message"))
         .and_then(|msg_response| {
             let slack_message = format!(
                 "```{}```\n(from: {})",
@@ -265,37 +366,8 @@ fn forward_email_to_slack(
                     thread_ts: Some(msg_response.ts.clone()),
                     as_user: true
                 })
-                .map_err(|_| bad_request("Unable to send slack message"))
         })?;
     Ok(String::from("Sent"))
 
 }
 
-fn env_or_panic(k: &str) -> String {
-    match env::var(k)  {
-        Ok(val) => val,
-        Err(msg) => panic!(format!("No {} in environment: {}", k, msg))
-    }
-}
-
-fn mount() -> Rocket {
-    rocket::ignite().mount("/", routes![
-        no_reply_response,
-        forward_email_to_slack
-    ])
-}
-
-fn main() {
-    dotenv().ok();
-    env_logger::init();
-
-    let rocket = mount();
-
-    rocket.manage(Slack {
-        api_key: env_or_panic("SLACK_API_TOKEN")
-    }).manage(Mailgun {
-        api_key: env_or_panic("MAILGUN_API_KEY"),
-        domain: env_or_panic("MAILGUN_DOMAIN"),
-        from: env_or_panic("MAILGUN_FROM")
-    }).launch();
-}
