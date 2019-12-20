@@ -18,10 +18,12 @@
 #![feature(plugin)]
 #![feature(box_patterns)]
 
+#[macro_use] extern crate log;
+extern crate chashmap;
 extern crate dotenv;
+extern crate futures;
 extern crate hex;
 extern crate hmac;
-#[macro_use] extern crate log;
 extern crate pretty_env_logger;
 extern crate reqwest;
 extern crate serde;
@@ -29,7 +31,6 @@ extern crate serde_json;
 extern crate sha2;
 extern crate tokio;
 extern crate warp;
-extern crate futures;
 
 
 mod slack;
@@ -48,12 +49,19 @@ use std::net::SocketAddr;
 use std::error::Error as StdError;
 use std::fmt::{self, Display};
 use std::str;
-use futures::stream::{Stream};
-use crate::futures::Future;
+use std::sync::Arc;
+
 
 use serde::Serialize;
 
 use dotenv::dotenv;
+
+use chashmap::CHashMap;
+
+use futures::stream::{Stream};
+use crate::futures::Future;
+
+use chrono::{DateTime, Utc};
 
 use warp::{
     path,
@@ -70,9 +78,56 @@ fn env_or_panic(k: &str) -> String {
     }
 }
 
+#[derive(Clone)]
+struct Minutes(pub i64);
+
+#[derive(Clone)]
+struct LastResponseLog {
+    time_between_responses: Minutes,
+    last_response_date: Arc<CHashMap<String, DateTime<Utc>>>,
+}
+
+impl LastResponseLog {
+
+    fn is_too_old(&self, dt: &DateTime<Utc>) -> bool {
+        (Utc::now() - (*dt)).num_minutes() > self.time_between_responses.0
+    }
+
+
+    fn can_send(&self, email: &String) -> bool {
+        match self.last_response_date.get(email) {
+            Some(v) => self.is_too_old(&v),
+            None => true
+        }
+    }
+
+    fn log_send(&self, email: &String) {
+        self.clear_old();
+        self.last_response_date.insert(email.clone(), Utc::now());
+    }
+
+    fn clear_old(&self) {
+        let orig_size = self.last_response_date.len();
+        self.last_response_date.retain(|_, v| !self.is_too_old(v));
+        let new_size = self.last_response_date.len();
+        info!("Cleared {} old entries from last_response_date", orig_size-new_size);
+    }
+}
+
 fn main() {
     dotenv().ok();
     pretty_env_logger::init();
+
+    let last_response_date: CHashMap<String, DateTime<Utc>> = CHashMap::new();
+    let last_response_log = LastResponseLog {
+        time_between_responses: Minutes(
+            env_or_panic("TIME_BETWEEN_RESPONSES_MINUTES")
+                .parse()
+                .expect("TIME_BETWEEN_RESPONSES_MINUTES must be a i64")
+        ),
+        last_response_date: Arc::new(last_response_date),
+    };
+    let last_response_log = warp::any().map(move || last_response_log.clone());
 
     let mailgun = Mailgun {
         api_key: env_or_panic("MAILGUN_API_KEY"),
@@ -94,13 +149,15 @@ fn main() {
         .and(warp::body::form());
 
     let no_reply_urlencoded = urlencoded.clone()
+        .and(last_response_log.clone())
         .and(path!("emails" / "responder" / String))
         .and_then(send_no_reply_template)
         .recover(recover_error);
 
     let no_reply_multipart = basics.clone()
-        .and(path!("emails" / "responder" / String))
         .and(multipart::form())
+        .and(last_response_log.clone())
+        .and(path!("emails" / "responder" / String))
         .and_then(send_no_reply_template_multipart)
         .recover(recover_error);
 
@@ -229,27 +286,44 @@ fn multipart_to_mailgun(form_data: FormData) -> Result<MailgunEmailReceived, Mul
     }
 }
 
-fn send_no_reply_template_multipart(mailgun: Mailgun, template: String, form_data: FormData)
-    -> Result<impl warp::Reply, Rejection>
+fn send_no_reply_template_multipart(
+    mailgun: Mailgun,
+    form_data: FormData,
+    last_response_log: LastResponseLog,
+    template: String
+) -> Result<impl warp::Reply, Rejection>
 {
     let mailgun_received = multipart_to_mailgun(form_data)?;
-    send_no_reply_template(mailgun, mailgun_received, template)
+    send_no_reply_template(mailgun, mailgun_received, last_response_log, template)
 }
 
 
-fn send_no_reply_template(mailgun: Mailgun, email: MailgunEmailReceived, template: String)
-    -> Result<impl warp::Reply, Rejection>
+fn send_no_reply_template(
+    mailgun: Mailgun,
+    email: MailgunEmailReceived,
+    last_response_log: LastResponseLog,
+    template: String
+) -> Result<impl warp::Reply, Rejection>
 {
     mailgun.verify_hmac(&email)?;
     let message_id = email.get_message_id()?;
-    mailgun.send_email(&EmailTemplate {
-        recipient: email.from,
-        subject: format!("Re: {}", email.subject),
-        template: template,
-        in_reply_to: message_id.clone(),
-        references: message_id
+    if last_response_log.can_send(&email.from) {
+        last_response_log.log_send(&email.from);
+        mailgun.send_email(&EmailTemplate {
+            recipient: email.from,
+            subject: format!("Re: {}", email.subject),
+            template: template,
+            in_reply_to: message_id.clone(),
+            references: message_id
 
-    })?;
+        })?;
+    } else {
+        info!(
+            "Already responded to {} within the past {} minutes. Skipping.",
+            email.from,
+            last_response_log.time_between_responses.0
+        );
+    }
     Ok("Message Processed")
 }
 
