@@ -145,25 +145,24 @@ fn main() {
         .and(warp::body::content_length_limit(1024 * 1024 * 2)) // 2 MB right?
         .and(mailgun.clone());
 
-    let urlencoded = basics.clone()
-        .and(warp::body::form());
-
-    let no_reply_urlencoded = urlencoded.clone()
+    let no_reply_urlencoded = basics.clone()
         .and(last_response_log.clone())
         .and(path!("emails" / "responder" / String))
+        .and(warp::body::form())
         .and_then(send_no_reply_template)
         .recover(recover_error);
 
     let no_reply_multipart = basics.clone()
-        .and(multipart::form())
         .and(last_response_log.clone())
         .and(path!("emails" / "responder" / String))
+        .and(multipart::form())
         .and_then(send_no_reply_template_multipart)
         .recover(recover_error);
 
-    let forward_email = urlencoded.clone()
+    let forward_email = basics.clone()
         .and(slack.clone())
         .and(path!("emails" / "forward" / "slack" / String))
+        .and(warp::body::form())
         .and_then(forward_email_to_slack)
         .recover(recover_error);
 
@@ -288,21 +287,21 @@ fn multipart_to_mailgun(form_data: FormData) -> Result<MailgunEmailReceived, Mul
 
 fn send_no_reply_template_multipart(
     mailgun: Mailgun,
-    form_data: FormData,
     last_response_log: LastResponseLog,
-    template: String
+    template: String,
+    form_data: FormData
 ) -> Result<impl warp::Reply, Rejection>
 {
     let mailgun_received = multipart_to_mailgun(form_data)?;
-    send_no_reply_template(mailgun, mailgun_received, last_response_log, template)
+    send_no_reply_template(mailgun, last_response_log, template, mailgun_received)
 }
 
 
 fn send_no_reply_template(
     mailgun: Mailgun,
-    email: MailgunEmailReceived,
     last_response_log: LastResponseLog,
-    template: String
+    template: String,
+    email: MailgunEmailReceived
 ) -> Result<impl warp::Reply, Rejection>
 {
     mailgun.verify_hmac(&email)?;
@@ -334,14 +333,14 @@ fn forward_email_to_slack_multipart(
     form_data: FormData,
 ) ->  Result<impl warp::Reply, Rejection> {
     let mailgun_received = multipart_to_mailgun(form_data)?;
-    forward_email_to_slack(mailgun, mailgun_received, slack_client, channel_id)
+    forward_email_to_slack(mailgun, slack_client, channel_id, mailgun_received)
 }
 
 fn forward_email_to_slack(
     mailgun: Mailgun,
-    email: MailgunEmailReceived,
     slack_client: Slack,
-    channel_id: String
+    channel_id: String,
+    email: MailgunEmailReceived
 ) ->  Result<impl warp::Reply, Rejection> {
     mailgun.verify_hmac(&email)?;
 
