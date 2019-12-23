@@ -337,9 +337,17 @@ fn forward_email_to_slack_multipart(
 }
 
 fn unify_new_lines(value: &String) -> String {
+    let mut count = 0;
     value.split("\n")
         .map(|s| s.trim())
-        .filter(|s| s.len() > 0)
+        .filter(|s| {
+            if s.len() == 0 {
+                count += 1;
+            } else {
+                count = 0;
+            }
+            s.len() > 0 || count <= 1
+        })
         .collect::<Vec<&str>>()
         .join("\n")
 }
