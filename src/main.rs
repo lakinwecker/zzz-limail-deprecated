@@ -336,6 +336,22 @@ fn forward_email_to_slack_multipart(
     forward_email_to_slack(mailgun, slack_client, channel_id, mailgun_received)
 }
 
+fn unify_new_lines(value: &String) -> String {
+    let mut count = 0;
+    value.split("\n")
+        .map(|s| s.trim())
+        .filter(|s| {
+            if s.len() == 0 {
+                count += 1;
+            } else {
+                count = 0;
+            }
+            s.len() > 0 || count <= 1
+        })
+        .collect::<Vec<&str>>()
+        .join("\n")
+}
+
 fn forward_email_to_slack(
     mailgun: Mailgun,
     slack_client: Slack,
@@ -355,7 +371,7 @@ fn forward_email_to_slack(
         .and_then(|msg_response| {
             let slack_message = format!(
                 "```{}```\n(from: {})",
-                email.body_plain.clone(),
+                unify_new_lines(&email.body_plain),
                 email.sender.clone()
             );
             slack_client
