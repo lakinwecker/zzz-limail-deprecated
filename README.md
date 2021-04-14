@@ -1,20 +1,4 @@
-limail
-======
-
-A simple helper for lichess to manage auto responses and deal with email
-from slack.
-
-[![Build Status](https://travis-ci.org/lakinwecker/limail.svg?branch=master)](https://travis-ci.org/lakinwecker/limail)
-
-
-HTTP API
---------
-
-### `POST /emails/responder/<template>`
-A webhook for mailgun. Given an email, respond to it using the provided template.
-
-### `POST /emails/forward/slack/<channel_id>`
-A webhook for mailgun. Given an email, post it to slack in the given channel
+DEPRECATED
 
 License
 -------
